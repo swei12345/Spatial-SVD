@@ -1,0 +1,554 @@
+---
+title: "sample 11 from DLPFC data"
+output: html_document
+date: "2023-11-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(SpatialPCA)
+```
+
+```{r}
+
+#----------------
+# LIBD
+#----------------
+
+dataset="LIBD"
+
+# BiocManager::install("spatialLIBD")
+library('spatialLIBD')
+sce <- fetch_data(type = 'sce')
+metaData = SingleCellExperiment::colData(sce)
+expr = SingleCellExperiment::counts(sce)
+sample_names <- paste0("sample_", unique(colData(sce)$sample_name))
+
+
+i=11 ### try sample 11
+sce_sub <- sce[, colData(sce)$sample_name == gsub("^sample_", "", sample_names[i])]
+dim(sce_sub)
+count_sub = SingleCellExperiment::counts(sce_sub)
+xy_coords <- data.frame(
+        x_coord = colData(sce_sub)[, c("imagecol")], 
+        y_coord = -colData(sce_sub)[, c("imagerow")]
+    )
+
+```
+
+```{r}
+## Load known marker genes (from Kristen)
+# load spreadsheet of known marker genes (from Kristen)
+# download from https://github.com/LieberInstitute/HumanPilot/blob/master/Analysis/KRM_Layer_Markers.xlsx
+library( readxl)
+KRM_Layer_Markers <- read_xlsx("KRM_Layer_Markers.xlsx")
+dim(KRM_Layer_Markers)
+```
+
+```{r}
+marker_genes_KRM <- KRM_Layer_Markers$Gene
+sum(toupper(marker_genes_KRM) %in% rowData(sce)$gene_name)
+genes_markers <- data.frame(gene_name = toupper(marker_genes_KRM))
+genes_markers$gene_id <- rowData(sce)$gene_id[match(genes_markers$gene_name, rowData(sce)$gene_name)]
+```
+
+```{r}
+# check ground truth layer number
+true_num=c()
+ metaData1 = as.data.frame(metaData)
+ name=unique(colData(sce)$sample_name)
+for(i in 1:12){
+	true_num[i] = length(na.omit(unique(metaData1$layer_guess_reordered[which(metaData1$sample_name==name[i])])))
+
+}
+true_num
+#  [1] 7 7 7 7 5 5 5 5 7 7 7 7
+```
+
+
+```{r}
+# get ground truth labels for sample
+metaData1 = as.data.frame(metaData)
+library(dplyr)
+i = 11 
+KRM_manual_layers_sub <- filter(metaData1, sample_name == gsub("^sample_", "", sample_names[i])) ##Caution, this is the dplyr filter function
+
+dim(KRM_manual_layers_sub)
+
+```
+
+
+```{r}
+i = 11
+ground_truth_sub <- data.frame(truth = rep(NA, ncol(sce_sub)))
+rownames(ground_truth_sub) <- colnames(sce_sub)
+ground_truth_sub$truth = KRM_manual_layers_sub$layer_guess_reordered
+Layer_sub = KRM_manual_layers_sub$layer_guess_reordered
+sum(as.character(KRM_manual_layers_sub$barcode) == colnames(count_sub)) # yes all matched
+
+
+save(Layer_sub, xy_coords, KRM_manual_layers_sub, count_sub, file = paste0("LIBD_sample",i,".RData") ) ## save sample data
+
+```
+
+```{r}
+#load("LIBD_sample12.Rdata")
+```
+
+
+
+
+```{r}
+library(SPARK)
+library(Seurat)
+library(peakRAM)
+library(SpatialPCA)
+library(ggplot2)
+
+```
+
+```{r}
+xy_coords = as.matrix(xy_coords)
+rownames(xy_coords) = colnames(count_sub)
+
+LIBD = CreateSpatialPCAObject(counts=count_sub, location=xy_coords, project = "SpatialPCA",gene.type="spatial",sparkversion="sparkx",numCores_spark=1,gene.number=3000, customGenelist=NULL,min.loctions = 20, min.features=20)  ### mc.cores > 1 is not supported on Windows for mcapply. Instead of numCores_spark = 5,can use = 1 in the mean time (This step is not very time-consuming, 25 seconds at most)
+
+```
+
+```{r}
+mem <- peakRAM({
+start_time <- Sys.time()
+LIBD = SpatialPCA_buildKernel(LIBD, kerneltype="gaussian", bandwidthtype="SJ",bandwidth.set.by.user=NULL)
+LIBD = SpatialPCA_EstimateLoading(LIBD,fast=FALSE,SpatialPCnum=5)
+LIBD = SpatialPCA_SpatialPCs(LIBD, fast=FALSE)
+end_time <- Sys.time()
+T = end_time - start_time
+})
+```
+
+```{r}
+i = 11
+SpatialPCA_result = list()
+SpatialPCA_result$SpatialPCs  = LIBD@SpatialPCs # extracted spatial PCs
+SpatialPCA_result$location = LIBD@location
+truth = KRM_manual_layers_sub$layer_guess_reordered[match(colnames(LIBD@normalized_expr),colnames(count_sub))]
+SpatialPCA_result$truth = truth
+```
+
+```{r}
+clusterNum=c(7,7,7,7,5,5,5,5,7,7,7,7)
+
+```
+
+### Compute ARI on clusters for SpatialPCA and PCA; clustering method: Walktrap
+
+```{r}
+i = 11
+pred_cluster= walktrap_clustering(clusterNum[i],SpatialPCA_result$SpatialPCs,knearest=70 ) # I set knearest=70 for all 12 samples in the DLPFC data. User can try other knearest number in other datasets, e.g. knearest=round(sqrt(dim(SpatialPCA_result$SpatialPCs)[2]))
+SpatialPCA_result$clusterlabel = pred_cluster
+SpatialPCA_result$clusterlabel_refine=refine_cluster_10x(pred_cluster,SpatialPCA_result$location,shape="hexagon") 
+```
+
+```{r}
+ind_na=which(is.na(SpatialPCA_result$truth)) # we remove will NA samples in the original annotation to calculate ARI.
+library(mclust)
+SpatialPCA_result$ARI = adjustedRandIndex(SpatialPCA_result$clusterlabel_refine[-ind_na],SpatialPCA_result$truth[-ind_na])
+# for sample i, calculate the ARI.
+```
+
+
+```{r}
+library(lisi)
+metadata_DLPFC = data.frame("SpatialPCA" = SpatialPCA_result$clusterlabel_refine)
+SpatialPCA_result$LISI <- compute_lisi(SpatialPCA_result$location, metadata_DLPFC, c('SpatialPCA'))
+
+save(SpatialPCA_result, file = paste0("SpatialPCA_DLPFC_sample",i,"result.RData"))
+```
+
+
+
+```{r}
+i=11 ## sample 11
+library(ggpubr)
+library(umap)
+
+xy_coords = as.matrix(xy_coords)
+rownames(xy_coords) = colnames(count_sub)
+load( paste0("SpatialPCA_DLPFC_sample",i,"result.RData"))
+
+```
+
+
+
+```{r}
+
+# ARI; compare estimated clusters with ground truth
+library(aricode)
+
+
+
+```
+
+
+```{r}
+load("LIBD_sample11_normalized.Rdata")
+```
+
+```{r}
+i = 11
+load( paste0("SpatialPCA_DLPFC_sample",i,"result.RData"))
+ind_na=which(is.na(SpatialPCA_result$truth)) # we remove NA samples in the original annotation to calculate ARI.
+library(mclust)
+```
+
+### PCA
+
+```{r}
+X0 = LIBD@normalized_expr
+```
+
+```{r}
+X0_k = svd(X0)
+```
+
+```{r}
+v0 = X0_k$v[,1:5]   ## number of components = 5
+u0 = X0_k$u[, 1:5]
+```
+
+
+```{r}
+clusterNum=c(7,7,7,7,5,5,5,5,7,7,7,7)
+PCA_pred_cluster= walktrap_clustering(clusterNum[11],t(u0)%*%X0,knearest=70 ) 
+
+PCA_clusterlabel_refine=refine_cluster_10x(PCA_pred_cluster,SpatialPCA_result$location,shape="hexagon")
+```
+
+
+```{r}
+adjustedRandIndex(SpatialPCA_result$clusterlabel_refine[-ind_na],SpatialPCA_result$truth[-ind_na])
+adjustedRandIndex(PCA_clusterlabel_refine[-ind_na],SpatialPCA_result$truth[-ind_na])
+
+```
+
+
+
+### For iterative spatial SVD method: Ouput preprocessed locality and gene expression data for downstream cross validation step
+
+```{r}
+write.csv(as.data.frame(X0), file = ".../expr_data.csv")
+```
+
+```{r}
+write.csv(as.data.frame(scale(SpatialPCA_result$location)), file = ".../expr_locs.csv")
+```
+
+
+```{r}
+load( paste0("SpatialPCA_DLPFC_sample",11,"result.RData"))
+```
+
+
+### Load spatial SVD outputs (computed by iterative spatial SVD): 
+
+
+```{r}
+IP_U = as.matrix(read.csv("IP_U.csv"))
+IP_V = as.matrix(read.csv("IP_V.csv"))
+```
+
+
+```{r}
+PCA_denoised =  (t(IP_V)%*% X0) %*% (IP_U %*% t(IP_U))
+```
+
+
+
+## ARI for iterative SVD method
+
+
+```{r}
+clusterNum=c(7,7,7,7,5,5,5,5,7,7,7,7)
+IP_pred_cluster= walktrap_clustering(clusterNum[11],PCA_denoised,knearest=70 ) 
+IP_clusterlabel_refine=refine_cluster_10x(IP_pred_cluster,SpatialPCA_result$location,shape="hexagon")
+
+```
+
+```{r}
+ind_na=which(is.na(SpatialPCA_result$truth))
+```
+
+
+```{r}
+adjustedRandIndex(IP_clusterlabel_refine[-ind_na],SpatialPCA_result$truth[-ind_na])
+```
+
+
+
+### We can also use Gaussian mixture for clustering, and compute corresponding ARIs.
+```{r}
+library(ClusterR)
+```
+
+
+```{r}
+dat = as.data.frame(t(t(u0)%*%X0))  ## transpose 
+gmm = GMM(dat, 7, dist_mode = "eucl_dist", seed_mode = "random_subset", km_iter = 10,
+          em_iter = 10, verbose = F)          
+
+# predict centroids, covariance matrix and weights
+pr0 = as.factor(predict(gmm, newdata = dat))
+
+#pr0=refine_cluster_10x(pr0,SpatialPCA_result$location,shape="hexagon")
+```
+
+#### PCA 
+```{r}
+adjustedRandIndex(pr0[-ind_na],SpatialPCA_result$truth[-ind_na])
+```
+
+#### Spatial SVD
+```{r}
+dat = as.data.frame(t(PCA_denoised))  ## transpose 
+gmm = GMM(dat, 7, dist_mode = "eucl_dist", seed_mode = "random_subset", km_iter = 10,
+          em_iter = 10, verbose = F)          
+
+# predict centroids, covariance matrix and weights
+pr1 = as.factor(predict(gmm, newdata = dat))
+
+#pr1=refine_cluster_10x(pr1,SpatialPCA_result$location,shape="hexagon")
+```
+
+```{r}
+adjustedRandIndex(pr1[-ind_na],SpatialPCA_result$truth[-ind_na])
+```
+
+#### Spatial PCA
+
+```{r}
+dat = as.data.frame(t(SpatialPCA_result$SpatialPCs)) ## transpose 
+gmm = GMM(dat, 7, dist_mode = "eucl_dist", seed_mode = "random_subset", km_iter = 10,
+          em_iter = 10, verbose = F)          
+
+# predict centroids, covariance matrix and weights
+pr2 = as.factor(predict(gmm, newdata = dat))
+
+#pr2=refine_cluster_10x(pr2,SpatialPCA_result$location,shape="hexagon")
+```
+
+```{r}
+adjustedRandIndex(pr2[-ind_na],SpatialPCA_result$truth[-ind_na])
+```
+
+
+
+## Compute the CHAOS and PAS scores:
+
+```{r}
+require(parallel)
+library(pdist)
+fx_CHAOS_windows = function(clusterlabel, location){
+  # require(parallel)
+  matched_location=location
+  NAs = which(is.na(clusterlabel))
+  if(length(NAs>0)){
+    clusterlabel=clusterlabel[-NAs]
+    matched_location = matched_location[-NAs,]
+  }
+  matched_location = scale(matched_location)
+  dist_val = rep(0,length(unique(clusterlabel)))
+  count = 0
+  for(k in unique(clusterlabel)){
+    count = count + 1
+    location_cluster = matched_location[which(clusterlabel == k),]
+    if(length(location_cluster)==2){next}
+    #require(parallel)
+    results = mclapply(1:dim(location_cluster)[1], fx_1NN, location_in=location_cluster,mc.cores = 1)
+    dist_val[count] = sum(unlist(results))
+  }
+  dist_val = na.omit(dist_val)
+  return(sum(dist_val)/length(clusterlabel))
+
+}
+```
+
+```{r}
+fx_1NN = function(i,location_in){
+  # library(pdist)
+  line_i = rep(0,dim(location_in)[1])
+  line_i = pdist(location_in[i,],location_in[-i,])@dist
+  return(min(line_i))
+}
+
+#' @import pdist
+fx_kNN = function(i,location_in,k,cluster_in){
+  #library(pdist)
+  line_i = rep(0,dim(location_in)[1])
+  line_i = pdist(location_in[i,],location_in[-i,])@dist
+  ind = order(line_i)[1:k]
+  cluster_use = cluster_in[-i]
+  if(sum(cluster_use[ind] != cluster_in[i])>(k/2)){
+    return(1)
+  }else{
+    return(0)
+  }
+
+}
+```
+
+##### CHAOS (via Walktrap): 
+```{r}
+fx_CHAOS_windows(PCA_clusterlabel_refine,SpatialPCA_result$location) ### PCA
+```
+
+```{r}
+fx_CHAOS_windows(SpatialPCA_result$clusterlabel_refine,SpatialPCA_result$location) ### Spatial PCA
+```
+
+```{r}
+fx_CHAOS_windows(IP_clusterlabel_refine,SpatialPCA_result$location) ### Iterative SVD
+```
+
+##### Via Gaussian Mixture
+```{r}
+fx_CHAOS_windows(pr0,SpatialPCA_result$location) ###PCA
+```
+
+```{r}
+fx_CHAOS_windows(pr2,SpatialPCA_result$location) ### Spatial PCA
+```
+
+```{r}
+fx_CHAOS_windows(pr1,SpatialPCA_result$location) ### Iterative SVD
+```
+
+### PAS
+
+```{r}
+fx_PAS_windows = function(clusterlabel, location){
+  # require(parallel)
+
+  matched_location=location
+  NAs = which(is.na(clusterlabel))
+  if(length(NAs>0)){
+    clusterlabel=clusterlabel[-NAs]
+    matched_location = matched_location[-NAs,]
+  }
+
+  results = mclapply(1:dim(matched_location)[1], fx_kNN, location_in=matched_location,k=10,cluster_in=clusterlabel, mc.cores = 1)
+  return(sum(unlist(results))/length(clusterlabel))
+}
+```
+
+
+```{r}
+fx_PAS_windows(SpatialPCA_result$clusterlabel_refine,SpatialPCA_result$location)
+```
+
+```{r}
+fx_PAS_windows(IP_clusterlabel_refine,SpatialPCA_result$location)
+```
+
+```{r}
+fx_PAS_windows(pr0,SpatialPCA_result$location)
+```
+
+```{r}
+fx_PAS_windows(pr2,SpatialPCA_result$location)
+```
+
+```{r}
+fx_PAS_windows(pr1,SpatialPCA_result$location)
+```
+
+### LISI scores
+
+###SpatialPCA
+```{r}
+library(lisi)
+metadata_DLPFC = data.frame("SpatialPCA" = pr2)
+df_test = compute_lisi(SpatialPCA_result$location, metadata_DLPFC, c('SpatialPCA'))
+median(df_test$SpatialPCA)
+```
+
+### PCA
+```{r}
+metadata_DLPFC0 = data.frame("PCA" = pr0)
+df_test = compute_lisi(SpatialPCA_result$location, metadata_DLPFC0, c('PCA'))
+median(df_test$SpatialPCA)
+```
+
+### Iterative
+```{r}
+metadata_DLPFC1 = data.frame("SVD" = pr1)
+df_test = compute_lisi(SpatialPCA_result$location, metadata_DLPFC1, c('SVD'))
+median(df_test$SpatialPCA)
+```
+
+
+
+
+
+### Plotting leading singular vectors (embeddings, PCs, etc)
+
+
+
+```{r}
+PCA_denoised0 = PCA_denoised[,-ind_na ]
+```
+
+
+
+```{r}
+par(pty = "s")
+
+plot(PCA_denoised0[1,],PCA_denoised0[2,], col = as.factor(SpatialPCA_result$truth[-ind_na]), main = "exp", xlab = "1st PC", ylab = "2nd PC") ### Iterative SVD
+```
+
+
+```{r}
+par(pty = "s")
+
+plot(SpatialPCA_result$SpatialPCs[,-ind_na][1,],SpatialPCA_result$SpatialPCs[,-ind_na][2,], col = as.factor(SpatialPCA_result$truth[-ind_na]), main = "Spatial PCA", xlab = "1st PC", ylab = "2nd PC") 
+```
+
+```{r}
+par(pty = "s")
+
+plot(t(v0)[1,],t(v0)[2,], col = as.factor(SpatialPCA_result$truth), main = "tau = 0", xlab = "u1", ylab = "u2") 
+#plot(v0[,1], v0[,2], col = as.factor(syn.locs$group), main = "PCA")
+```
+
+
+
+### Visualizations of clusters for different methods
+```{r}
+library(ggpubr)
+cbp=c("#5CB85C" ,"#9C9EDE" ,"#FFDC91", "#4DBBD5" ,"#FF9896" ,"#FED439", "#E377C2", "#FED439")
+p1 = plot_cluster(location=SpatialPCA_result$location,as.factor(pr2),pointsize=2,text_size=15 ,title_in=paste0("SpatialPCA"),color_in=cbp)
+p2 = plot_cluster(location=SpatialPCA_result$location,SpatialPCA_result$truth,pointsize=2,text_size=15 ,title_in=paste0("Truth"),color_in=cbp)
+p3 = plot_cluster(location=SpatialPCA_result$location,as.factor(pr0),pointsize=2,text_size=15 ,title_in=paste0("PCA"),color_in=cbp)
+p4 = plot_cluster(location=SpatialPCA_result$location,as.factor(pr1),pointsize=2,text_size=15 ,title_in=paste0("iterative_SVD"),color_in=cbp)
+
+pdf("clusters_Gaussian_Mixture.pdf",width=8, height=8)
+ggarrange(p1, p2, p3, p4,
+          # labels = c("A", "B", "C"),
+          ncol = 2, nrow = 2)
+```
+
+```{r}
+
+p1 = plot_cluster(location=SpatialPCA_result$location,SpatialPCA_result$clusterlabel_refine,pointsize=2,text_size=15 ,title_in=paste0("SpatialPCA"),color_in=cbp)
+p2 = plot_cluster(location=SpatialPCA_result$location,SpatialPCA_result$truth,pointsize=2,text_size=15 ,title_in=paste0("Truth"),color_in=cbp)
+p3 = plot_cluster(location=SpatialPCA_result$location,PCA_clusterlabel_refine,pointsize=2,text_size=15 ,title_in=paste0("PCA"),color_in=cbp)
+p4 = plot_cluster(location=SpatialPCA_result$location,IP_clusterlabel_refine,pointsize=2,text_size=15 ,title_in=paste0("iterative_SVD"),color_in=cbp)
+
+pdf("clusters_walktrap.pdf",width=8, height=8)
+ggarrange(p1, p2, p3, p4,
+          # labels = c("A", "B", "C"),
+          ncol = 2, nrow = 2)
+```
+
