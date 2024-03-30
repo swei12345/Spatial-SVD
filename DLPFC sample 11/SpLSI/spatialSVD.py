@@ -18,7 +18,7 @@ from SpLSI import generate_topic_model as gen_model ### for knn interpolation
 from scipy.spatial import Delaunay
 
 
-
+####Fitting over a cross validation grid
 def spatialSVD(
         D,
         K, 
@@ -114,7 +114,7 @@ def spatialSVD(
 
 
 
-#### This function is for computing for a fixed lambd
+#### Fitting with a fixed lambda
 def spatialSVD2(
         D,
         K, 
